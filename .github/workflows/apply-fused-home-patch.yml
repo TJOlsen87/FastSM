@@ -1,0 +1,553 @@
+name=.github/workflows/apply-fused-home-patch.yml
+Wrap
+Copy code
+name: Apply fused_home patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply_patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch and push branch
+        env:
+          BRANCH_NAME: feat/fused-home-timeline
+        run: |
+          cat > fused_home.patch <<'PATCH'
+diff --git a/timeline.py b/timeline.py
+index 5b56aeda21593b61c6f0a318fdf6ed0a554cc2f4..96790799179b769c024f47c453f5d41f987b0e7a 100644
+--- a/timeline.py
++++ b/timeline.py
+@@ -1,26 +1,27 @@
+ from mastodon import MastodonError
++import datetime
+ import time
+ import speak
+ import sound
+ import threading
+ import os
+ import wx
+ from GUI import main
+ 
+ 
+ class TimelineSettings(object):
+ 	def __init__(self, account, tl):
+ 		self.account_id = account
+ 		self.tl = tl
+ 		self.mute = False
+ 		self.read = False
+ 		self.hide = False
+ 
+ 
+ class timeline(object):
+ 	def __init__(self, account, name, type, data=None, user=None, status=None, silent=False):
+ 		self.members = []
+ 		self.account = account
+ 		self.app = account.app
+ 		self.status = status
+ 		self.name = name
+@@ -28,80 +29,85 @@ class timeline(object):
+ 		self.initial = True
+ 		self.statuses = []
+ 		self.type = type
+ 		self.data = data
+ 		self.user = user
+ 		self.index = 0
+ 		self.page = 0
+ 		self.mute = False
+ 		self.read = False
+ 		self.hide = False
+ 		self._loading = False  # Flag to prevent concurrent load operations
+ 		self._stop_loading_all = False  # Flag to stop load_all_previous
+ 		self._loading_all_active = False  # Flag to track if load_all_previous is running
+ 		# Timeline position sync (for home timeline with Mastodon)
+ 		self._position_moved = False  # Track if user navigated since last load
+ 		self._last_synced_id = None  # Last position synced with server
+ 		# Set of status IDs for O(1) duplicate checking
+ 		self._status_ids = set()
+ 		# Lock for thread-safe duplicate checking and status addition
+ 		self._status_lock = threading.RLock()
+ 		# Gap tracking for cache - when API refresh doesn't fully connect to cached items
+ 		# List of gaps, each gap is a dict with 'max_id' (where to load from)
+ 		self._gaps = []
+ 		self._last_load_time = None  # Timestamp of last successful load (for gap detection)
+ 		self._gap_idle_threshold = 600  # Seconds of idle time before gap detection triggers (10 minutes)
++		# Fused timeline tracking (multi-account)
++		self._fused_since_ids = {}
++		self._fused_max_ids = {}
+ 
+ 		for i in self.app.timeline_settings:
+ 			if i.account_id == self.account.me.id and i.tl == self.name:
+ 				self.mute = i.mute
+ 				self.read = i.read
+ 				self.hide = i.hide
+ 
+ 		if self.type == "user" and self.name != "Sent" or self.type == "conversation" or self.type == "search" or self.type == "list":
+ 			if not silent:
+ 				sound.play(self.account, "open")
+ 			self.removable = True
+ 
+ 		# Set up the API function and kwargs based on timeline type
+ 		# Use maximum limit (100) for Bluesky, otherwise use user preference
+ 		if getattr(self.account.prefs, 'platform_type', '') == 'bluesky':
+ 			fetch_limit = 100  # Bluesky max
+ 		else:
+ 			fetch_limit = self.app.prefs.count
+ 		self.update_kwargs = {"limit": fetch_limit}
+ 		self.prev_kwargs = {"limit": fetch_limit}
+ 
+ 		# Use platform backend methods where available
+ 		if self.type == "home":
+ 			if hasattr(self.account, '_platform') and self.account._platform:
+ 				self.func = self.account._platform.get_home_timeline
+ 			else:
+ 				self.func = self.account.api.timeline_home
+ 		elif self.type == "mentions":
+ 			# Use platform backend - returns statuses extracted from notifications
+ 			self.func = self.account.get_mentions
++		elif self.type == "fused_home":
++			self.func = self._load_fused_home
+ 		elif self.type == "notifications":
+ 			if hasattr(self.account, '_platform') and self.account._platform:
+ 				self.func = self.account._platform.get_notifications
+ 			else:
+ 				self.func = self.account.api.notifications
+ 		elif self.type == "conversations":
+ 			# Check if platform supports DMs
+ 			if hasattr(self.account, 'supports_feature') and not self.account.supports_feature('direct_messages'):
+ 				# Platform doesn't support DMs - hide this timeline
+ 				self.hide = True
+ 				self.func = lambda **kwargs: []
+ 			else:
+ 				self.func = self.account.api.conversations
+ 		elif self.type == "favourites":
+ 			if hasattr(self.account, '_platform') and self.account._platform:
+ 				self.func = self.account._platform.get_favourites
+ 			else:
+ 				self.func = self.account.api.favourites
+ 			self.removable = True
+ 		elif self.type == "bookmarks":
+ 			if hasattr(self.account, '_platform') and self.account._platform:
+ 				self.func = self.account._platform.get_bookmarks
+ 			else:
+ 				self.func = self.account.api.bookmarks
+ 			self.removable = True
+@@ -254,99 +260,167 @@ class timeline(object):
+ 			return self.account._platform.search_statuses(self.data, limit=limit)
+ 
+ 		# Fallback to Mastodon API - handle versions that don't support limit
+ 		search_kwargs = {'q': self.data, 'result_type': 'statuses'}
+ 		if max_id:
+ 			search_kwargs['max_id'] = max_id
+ 		try:
+ 			# Try with limit first (Mastodon.py 2.8.0+)
+ 			result = self.account.api.search_v2(limit=limit, **search_kwargs)
+ 		except TypeError:
+ 			# Fall back without limit for older Mastodon.py versions
+ 			result = self.account.api.search_v2(**search_kwargs)
+ 		if hasattr(result, 'statuses'):
+ 			return result.statuses
+ 		return result.get('statuses', [])
+ 
+ 	def read_items(self, items):
+ 		pref = ""
+ 		if len(self.app.accounts) > 1:
+ 			pref = self.account.me.acct + ": "
+ 		if len(items) >= 4:
+ 			speak.speak(pref + str(len(items)) + " new in " + self.name)
+ 			return
+ 		speak.speak(pref + ", ".join(self.prepare(items)))
+ 
++	def _get_status_key(self, status):
++		"""Get a unique key for status de-duplication."""
++		if hasattr(status, 'id'):
++			if self.type == "fused_home":
++				fused_id = getattr(status, '_fused_id', None)
++				if fused_id:
++					return str(fused_id)
++				platform = getattr(status, '_platform', None) or getattr(status, '_source_platform', None)
++				if platform:
++					return f"{platform}:{status.id}"
++			return str(status.id)
++		return str(status)
++
++	def _fused_account_key(self, account):
++		platform_type = getattr(account.prefs, 'platform_type', '') or 'unknown'
++		account_id = getattr(account.me, 'id', None)
++		return f"{platform_type}:{account_id}"
++
++	def _tag_fused_status(self, status, account):
++		status._source_account = account
++		platform_type = getattr(account.prefs, 'platform_type', None) or getattr(status, '_platform', None)
++		status._source_platform = platform_type
++		account_key = self._fused_account_key(account)
++		status._fused_id = f"{account_key}:{status.id}"
++		if hasattr(status, 'reblog') and status.reblog:
++			self._tag_fused_status(status.reblog, account)
++		if hasattr(status, 'quote') and status.quote:
++			self._tag_fused_status(status.quote, account)
++
++	def _load_fused_home(self, limit=40, **kwargs):
++		all_statuses = []
++		load_previous = 'max_id' in kwargs
++		for account in self.app.accounts:
++			if not hasattr(account, '_platform') or not account._platform:
++				continue
++			account_key = self._fused_account_key(account)
++			platform_limit = limit
++			if getattr(account.prefs, 'platform_type', '') == 'bluesky':
++				platform_limit = min(limit, 100)
++			params = {'limit': platform_limit}
++			if load_previous:
++				max_id = self._fused_max_ids.get(account_key)
++				if max_id:
++					params['max_id'] = max_id
++			else:
++				since_id = self._fused_since_ids.get(account_key)
++				if since_id:
++					params['since_id'] = since_id
++			try:
++				statuses = account._platform.get_home_timeline(**params)
++			except Exception as error:
++				self.app.handle_error(error, f"{account.me.acct}'s fused home")
++				statuses = []
++			for status in statuses:
++				self._tag_fused_status(status, account)
++			if statuses:
++				if load_previous:
++					self._fused_max_ids[account_key] = str(statuses[-1].id)
++				else:
++					self._fused_since_ids[account_key] = str(statuses[0].id)
++					self._fused_max_ids[account_key] = str(statuses[-1].id)
++			all_statuses.extend(statuses)
++		all_statuses.sort(
++			key=lambda status: status.created_at or datetime.datetime.min,
++			reverse=not self.app.prefs.reversed,
++		)
++		return all_statuses
++
+ 	def _add_status_with_filter(self, status, to_front=False):
+ 		"""Add a status to the timeline, respecting any active filter.
+ 
+ 		Args:
+ 			status: The status to add
+ 			to_front: If True, insert at front of list; if False, append to end
+ 
+ 		Returns:
+ 			True if the status was added to the visible list, False if filtered out
+ 		"""
+ 		from GUI.timeline_filter import should_show_status
+ 
+ 		with self._status_lock:
+ 			# Always track ID for duplicate checking, even if filtered
+ 			if hasattr(status, 'id'):
+-				self._status_ids.add(str(status.id))
++				self._status_ids.add(self._get_status_key(status))
+ 
+ 			# Always add to unfiltered list if it exists
+ 			if hasattr(self, '_unfiltered_statuses'):
+ 				if to_front:
+ 					self._unfiltered_statuses.insert(0, status)
+ 				else:
+ 					self._unfiltered_statuses.append(status)
+ 
+ 			# Check if we should show this status based on filter
+ 			if hasattr(self, '_filter_settings') and self._filter_settings:
+ 				if not should_show_status(status, self._filter_settings, self.app, account=self.account):
+ 					return False
+ 
+ 			# Add to visible statuses
+ 			if to_front:
+ 				self.statuses.insert(0, status)
+ 			else:
+ 				self.statuses.append(status)
+ 			self.invalidate_display_cache()
+ 			return True
+ 
+ 	def has_status(self, status_id):
+ 		"""Check if a status ID is already in this timeline (O(1) lookup)."""
+ 		with self._status_lock:
+-			return str(status_id) in self._status_ids
++			return self._get_status_key(status_id) in self._status_ids
+ 
+ 	def try_add_status_id(self, status_id):
+ 		"""Atomically check if status ID exists and add it if not.
+ 
+ 		Returns True if the ID was added (not a duplicate), False if already exists.
+ 		"""
+ 		with self._status_lock:
+-			status_id_str = str(status_id)
++			status_id_str = self._get_status_key(status_id)
+ 			if status_id_str in self._status_ids:
+ 				return False
+ 			self._status_ids.add(status_id_str)
+ 			return True
+ 
+ 	def has_gap(self):
+ 		"""Check if there's a gap in the timeline that needs to be filled."""
+ 		return len(self._gaps) > 0
+ 
+ 	def gap_count(self):
+ 		"""Return the number of gaps in the timeline."""
+ 		return len(self._gaps)
+ 
+ 	def _should_detect_gaps(self):
+ 		"""Check if gap detection should apply to this timeline type.
+ 
+ 		Gap detection is currently disabled due to false positives
+ 		(e.g., network outages causing huge idle times that trigger
+ 		false gap detection on any full page refresh).
+ 		"""
+ 		# Disabled for now - the heuristic-based approach causes too many false positives
+ 		return False
+ 
+ 	# ============ Cache Methods ============
+ 
+@@ -414,51 +488,51 @@ class timeline(object):
+ 		if not cache:
+ 			return False
+ 
+ 		try:
+ 			items, metadata = cache.load_timeline(
+ 				self.type,
+ 				self.name,
+ 				self._get_timeline_data_key(),
+ 				self._get_item_type()
+ 			)
+ 
+ 			if not items:
+ 				return False
+ 
+ 			# Check if filter is active
+ 			filter_active = hasattr(self, '_filter_settings') and self._filter_settings
+ 			if filter_active:
+ 				from GUI.timeline_filter import should_show_status
+ 
+ 			# Load items into timeline
+ 			for item in items:
+ 				if item is None:
+ 					continue
+ 				# Track ID for O(1) duplicate checking
+ 				if hasattr(item, 'id'):
+-					self._status_ids.add(str(item.id))
++					self._status_ids.add(self._get_status_key(item))
+ 				# If filter is active, add to unfiltered list and only add to visible if it passes filter
+ 				if filter_active:
+ 					self._unfiltered_statuses.append(item)
+ 					if should_show_status(item, self._filter_settings, self.app, account=self.account):
+ 						self.statuses.append(item)
+ 				else:
+ 					self.statuses.append(item)
+ 
+ 			# Set up since_id for next refresh
+ 			if metadata.get('since_id') and items:
+ 				self.update_kwargs['since_id'] = metadata['since_id']
+ 
+ 			# Clear any stale gaps from cache (gap detection is currently disabled)
+ 			self._gaps = []
+ 
+ 			# Set last load time to now
+ 			import time
+ 			self._last_load_time = time.time()
+ 
+ 			# Store position ID for restore after API refresh
+ 			# ID-based restore is more robust than index when new items arrive
+ 			self._cached_position_id = metadata.get('last_position_id')
+ 
+ 			# Set initial position (will be corrected after API refresh using ID)
+ 			saved_index = metadata.get('last_index', 0)
+@@ -579,58 +653,58 @@ class timeline(object):
+ 			print(f"Cache save error for {self.name}: {e}")
+ 
+ 	def load_conversation(self):
+ 	=status = self.status
+ 
+ 		# For boosted posts, use the reblogged status for conversation context
+ 		# This ensures we get replies to the original post, not the boost wrapper
+ 		actual_status = status
+ 		if hasattr(status, 'reblog') and status.reblog:
+ 			actual_status = status.reblog
+ 
+ 		# Get the actual status ID (for mentions, id is notification_id, real id is in _original_status_id)
+ 		status_id = getattr(actual_status, '_original_status_id', None) or actual_status.id
+ 
+ 		# Try to use get_status_context for full thread (works better for Bluesky)
+ 		if hasattr(self.account, '_platform') and self.account._platform:
+ 			try:
+ 				context = self.account._platform.get_status_context(status_id)
+ 				ancestors = context.get('ancestors', [])
+ 				descendants = context.get('descendants', [])
+ 
+ 				# Build thread: ancestors -> current status -> descendants
+ 				for ancestor in ancestors:
+ 					self.statuses.append(ancestor)
+ 					if hasattr(ancestor, 'id'):
+-						self._status_ids.add(str(ancestor.id))
++						self._status_ids.add(self._get_status_key(ancestor))
+ 				self.statuses.append(actual_status)
+ 				if hasattr(actual_status, 'id'):
+-					self._status_ids.add(str(actual_status.id))
++					self._status_ids.add(self._get_status_key(actual_status))
+ 				for descendant in descendants:
+ 					self.statuses.append(descendant)
+ 					if hasattr(descendant, 'id'):
+-						self._status_ids.add(str(descendant.id))
++						self._status_ids.add(self._get_status_key(descendant))
+ 				self.invalidate_display_cache()
+ 			except Exception:
+ 				# Fall back to recursive method
+ 				self.process_status(actual_status)
+ 				self.invalidate_display_cache()
+ 		else:
+ 			# Fall back to recursive method for Mastodon API
+ 			self.process_status(actual_status)
+ 			self.invalidate_display_cache()
+ 
+ 		# Conversation threads should always be in chronological order (oldest first)
+ 		# regardless of the global reversed setting, since they represent a chat-like thread
+ 		if self.account.currentTimeline == self:
+ 			wx.CallAfter(main.window.refreshList)
+ 		sound.play(self.account, "search")
+ 		# Notify initial load complete
+ 		if self.initial:
+ 			self.initial = False
+ 			if hasattr(self.account, '_on_timeline_initial_load_complete'):
+ 				self.account._on_timeline_initial_load_complete()
+ 
+ 	def play(self, items=None):
+ 		if self.type == "user":
+ 			if not os.path.exists("sounds/" + self.account.prefs.soundpack + "/" + self.user.acct + ".ogg"):
+ 				sound.play(self.account, "user")
+@@ -668,51 +742,51 @@ class timeline(object):
+ 										break
+ 
+ 					if has_direct_mention:
+ 						sound.play(self.account, "messages")
+ 						return
+ 					elif has_mention:
+ 						sound.play(self.account, "mentions")
+ 						return
+ 
+ 				sound.play(self.account, "notification")
+ 			elif self.type == "mentions":
+ 				# Check if any items are direct messages
+ 				if items:
+ 					for item in items:
+ 						visibility = getattr(item, 'visibility', None)
+ 						if visibility == 'direct':
+ 							sound.play(self.account, "messages")
+ 							return
+ 				sound.play(self.account, self.name)
+ 			else:
+ 				sound.play(self.account, self.name)
+ 
+ 	def process_status(self, status):
+ 		self.statuses.append(status)
+ 		if hasattr(status, 'id'):
+-			self._status_ids.add(str(status.id))
++			self._status_ids.add(self._get_status_key(status))
+ 		try:
+ 			if hasattr(status, "in_reply_to_id") and status.in_reply_to_id is not None:
+ 				# Check if this is a remote status
+ 				if hasattr(status, '_instance_url') and status._instance_url:
+ 					parent = self._lookup_remote_status(status._instance_url, status.in_reply_to_id)
+ 				else:
+ 					parent = self.app.lookup_status(self.account, status.in_reply_to_id)
+ 				if parent:
+ 					self.process_status(parent)
+ 			if hasattr(status, "reblog") and status.reblog:
+ 				self.process_status(status.reblog)
+ 			if hasattr(status, "quote") and status.quote:
+ 				self.process_status(status.quote)
+ 		except:
+ 			pass
+ 
+ 	def _lookup_remote_status(self, instance_url, status_id):
+ 		"""Look up a status from a remote instance."""
+ 		if not hasattr(self.account, '_platform') or not self.account._platform:
+ 			return None
+ 		try:
+ 			remote_api = self.account._platform.get_or_create_remote_api(instance_url)
+ 			status = remote_api.status(id=status_id)
+ 			if status:
+ 				from platforms.mastodon.models import mastodon_status_to_universal
+@@ -940,51 +1014,51 @@ class timeline(object):
+ 							main.window.list.SetSelection(0)
+ 							self.account.currentIndex = 0
+ 							main.window.on_list_change(None)
+ 				return
+ 		else:
+ 			tl = items
+ 		if tl is not None:
+ 			newitems = 0
+ 			objs = []
+ 			objs2 = []
+ 			for i in tl:
+ 				# Handle notifications and conversations differently
+ 				# Use per-account user cache
+ 				if self.type == "notifications":
+ 					self.account.user_cache.add_users_from_notification(i)
+ 				elif self.type == "mentions":
+ 					# Mentions now come as statuses from platform backend
+ 					self.account.user_cache.add_users_from_status(i)
+ 				elif self.type == "conversations":
+ 					pass  # Conversations have different structure
+ 				else:
+ 					self.account.user_cache.add_users_from_status(i)
+ 
+ 				# Check for duplicates using atomic check-and-add to prevent race conditions
+ 				# between streaming and REST API refresh threads
+-				if self.try_add_status_id(i.id):
++				if self.try_add_status_id(i):
+ 					newitems += 1
+ 					# For initial/back load: add directly to statuses
+ 					# For refresh: collect first, add after processing all items
+ 					if self.initial or back:
+ 						# Insert at front for reversed (oldest at top), append for normal (newest at top)
+ 						shown = self._add_status_with_filter(i, to_front=self.app.prefs.reversed)
+ 						if shown:
+ 							if not self.app.prefs.reversed:
+ 								objs2.append(i)
+ 							else:
+ 								objs2.insert(0, i)
+ 					else:
+ 						# For new items, collect first, then add
+ 						if not self.app.prefs.reversed:
+ 							objs.append(i)
+ 							objs2.append(i)
+ 						else:
+ 							objs.insert(0, i)
+ 							objs2.insert(0, i)
+ 
+ 			if newitems == 0 and speech:
+ 				speak.speak("Nothing new.")
+ 			if newitems > 0:
+ 				if self.read:
+ 					self.read_items(objs2)
+ 
+PATCH
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH_NAME}"
+          git apply --3way fused_home.patch || { echo "apply failed"; exit 1; }
+          git add timeline.py
+          git commit -m "Add fused_home timeline support and unified status deduplication" || echo "No changes to commit"
+          git push -u origin "${BRANCH_NAME}"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Add fused_home timeline support and unified status deduplication"
+          branch: feat/fused-home-timeline
+          title: "Add fused_home timeline support"
+          body: "Automated patch application: adds fused_home   timeline implementation and deduplication changes."
