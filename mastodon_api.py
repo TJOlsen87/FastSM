@@ -393,6 +393,17 @@ class mastodon(object):
 			)
 		try:
 			self.api = Client(base_url=service)
+			# Override the default httpx User-Agent. Bluesky's AWS WAF returns
+			# a bare HTML 403 at the edge for the stock 'python-httpx/x.y.z'
+			# UA (heavily abused by scrapers), so the createSession call never
+			# reaches the PDS. Identifying as FastSM gets us past the WAF.
+			try:
+				self.api.request.set_additional_headers({
+					'User-Agent': f'{APP_NAME}/{APP_VERSION} (atproto-python)',
+				})
+			except Exception as ua_e:
+				if _logger:
+					_logger.warning("Could not set Bluesky User-Agent override: %s", ua_e)
 			raw_profile = self.api.login(handle, self.prefs.bluesky_password)
 			self.me = bluesky_profile_to_universal(raw_profile)
 			if _logger:
