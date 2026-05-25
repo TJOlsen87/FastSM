@@ -191,10 +191,10 @@ jobs:
           python -m pip install --upgrade pip
           # wxPython's extras page is a plain directory listing, not a PEP 503
           # simple index — so it must be passed via --find-links, not
-          # --extra-index-url. Pin 4.2.2 since that's the newest wheel there.
-          # If the extras host is unavailable, build wxPython from the sdist
+          # --extra-index-url. Prefer the latest available wxPython wheel there.
+          # If the extras host is unavailable, wxPython will be built from the sdist when installing requirements
           # using the same family of Ubuntu build dependencies as Phoenix CI.
-          if ! pip install --only-binary wxPython -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-22.04 wxPython==4.2.2; then
+          if ! pip install --only-binary wxPython -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-22.04 wxPython; then
             sudo apt-get install -y \
               build-essential \
               dpkg-dev \
@@ -211,7 +211,6 @@ jobs:
               libtiff-dev \
               libwebkit2gtk-4.0-dev \
               libxtst-dev
-            pip install wxPython==4.2.2
           fi
           pip install -r requirements.txt
           # Needed by build.py's post-build libprism rewrite.
