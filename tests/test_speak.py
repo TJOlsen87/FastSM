@@ -22,6 +22,12 @@ def _load_speak_with_context(context_cls):
 	)
 	sys.modules.pop("speak", None)
 	sys.modules["prism"] = fake_prism
+	# Stub out 'application' so speak._use_legacy() doesn't drag the real
+	# (heavyweight) application module into the unit test. Without this, a test
+	# that fakes sys.platform to 'darwin' bypasses the Linux short-circuit in
+	# _use_legacy() and pays a cold ~0.15s+ import inside the latency-sensitive
+	# shutdown path, which blows the bounded-wait timing budget on slower CI.
+	sys.modules["application"] = types.SimpleNamespace(get_app=lambda: None)
 	speak = importlib.import_module("speak")
 	speak._logger.disabled = True
 	return speak
@@ -31,6 +37,7 @@ class SpeakPrismFailureTests(unittest.TestCase):
 	def tearDown(self):
 		sys.modules.pop("speak", None)
 		sys.modules.pop("prism", None)
+		sys.modules.pop("application", None)
 
 	def test_non_prism_backend_errors_are_swallowed_after_retry(self):
 		speak_calls = []
