@@ -1010,7 +1010,11 @@ class timeline(object):
 						if visibility == 'direct':
 							sound.play(self.account, "messages")
 							return
-				sound.play(self.account, self.name)
+				sound.play(self.account, "mentions")
+			elif self.type == "home":
+				sound.play(self.account, "home")
+			elif self.type == "conversations":
+				sound.play(self.account, "conversations")
 			else:
 				sound.play(self.account, self.name)
 

@@ -545,28 +545,44 @@ def _get_bundled_path():
 # Mapping of new sound names to old names for backwards compatibility with custom soundpacks
 _SOUND_FALLBACKS = {
 	'send_post': 'send_tweet',
+	'home': 'Home',
+	'mentions': 'Mentions',
+	'conversations': ('Conversations', 'messages'),
 }
+
+def _sound_candidate_names(filename):
+	"""Return the primary sound name followed by compatible aliases."""
+	names = [filename]
+	fallback = _SOUND_FALLBACKS.get(filename)
+	if isinstance(fallback, (tuple, list)):
+		names.extend(fallback)
+	elif fallback:
+		names.append(fallback)
+	return names
+
+def _find_sound_in_pack(app, account, pack, filename, bundled_path):
+	"""Find a sound file in a specific soundpack."""
+	# Check user config first (highest priority)
+	if os.path.exists(app.confpath + "/sounds/" + pack + "/" + filename + ".ogg"):
+		return app.confpath + "/sounds/" + pack + "/" + filename + ".ogg"
+	# Check relative path (for development)
+	if os.path.exists("sounds/" + pack + "/" + filename + ".ogg"):
+		return "sounds/" + pack + "/" + filename + ".ogg"
+	# Check bundled path (for frozen apps)
+	if bundled_path and os.path.exists(bundled_path + "/sounds/" + pack + "/" + filename + ".ogg"):
+		return bundled_path + "/sounds/" + pack + "/" + filename + ".ogg"
+	return None
 
 def _find_sound_path(app, account, filename, bundled_path):
 	"""Find the path to a sound file, checking all locations."""
-	# Check user config first (highest priority)
-	if os.path.exists(app.confpath + "/sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"):
-		return app.confpath + "/sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"
-	# Check relative path (for development)
-	if os.path.exists("sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"):
-		return "sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"
-	# Check bundled path (for frozen apps)
-	if bundled_path and os.path.exists(bundled_path + "/sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"):
-		return bundled_path + "/sounds/" + account.prefs.soundpack + "/" + filename + ".ogg"
-	# Fall back to default soundpack - user config
-	if os.path.exists(app.confpath + "/sounds/default/" + filename + ".ogg"):
-		return app.confpath + "/sounds/default/" + filename + ".ogg"
-	# Fall back to default - relative path
-	if os.path.exists("sounds/default/" + filename + ".ogg"):
-		return "sounds/default/" + filename + ".ogg"
-	# Fall back to default - bundled path
-	if bundled_path and os.path.exists(bundled_path + "/sounds/default/" + filename + ".ogg"):
-		return bundled_path + "/sounds/default/" + filename + ".ogg"
+	for candidate in _sound_candidate_names(filename):
+		path = _find_sound_in_pack(app, account, account.prefs.soundpack, candidate, bundled_path)
+		if path:
+			return path
+	for candidate in _sound_candidate_names(filename):
+		path = _find_sound_in_pack(app, account, "default", candidate, bundled_path)
+		if path:
+			return path
 	return None
 
 def play(account, filename, pack="", wait=False):
@@ -581,11 +597,6 @@ def play(account, filename, pack="", wait=False):
 
 	# Try to find the sound file
 	path = _find_sound_path(app, account, filename, bundled_path)
-
-	# If not found and there's a fallback name, try the old name
-	# This allows custom soundpacks with old "tweet" names to still work
-	if not path and filename in _SOUND_FALLBACKS:
-		path = _find_sound_path(app, account, _SOUND_FALLBACKS[filename], bundled_path)
 
 	if not path:
 		return
