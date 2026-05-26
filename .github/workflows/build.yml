@@ -9,7 +9,7 @@ on:
       - '.gitattributes'
       - 'LICENSE'
   schedule:
-    - cron: '0 6 * * *'     # daily at 06:00 UTC: build + publish release
+    - cron: '37 6 * * *'     # daily at 06:37 UTC: build + publish release
   workflow_dispatch:        # manual trigger: build + publish release
 
 permissions:
